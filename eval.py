@@ -54,7 +54,7 @@ FROZEN_FILES = ["prepare.py", "eval.py", "task.md", "program.md"]
 # ===========================================================================
 
 def utc_stamp():
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
 
 
 def utc_iso():
@@ -172,6 +172,7 @@ CASES_COLUMNS = [
 SUMMARY_COLUMNS = [
     "run_id", "timestamp_utc", "task_name", "task_version", "mode",
     "num_cases", "num_ok", "num_timeouts", "num_exceptions", "num_invalid",
+    "num_oom", "num_infrastructure_errors",
     "aggregate_score", "mean_score", "median_score", "success_rate",
     "mean_runtime_s", "p95_runtime_s", "max_runtime_s",
     "mean_peak_rss_mb", "max_peak_rss_mb", "train_sha256", "run_dir",
@@ -237,13 +238,33 @@ class AutoResearch:
         return list(self.mode_budgets)
 
     def ensure_data(self, mode):
-        if self.manifest_path(mode).exists():
+        def data_is_complete():
+            manifest_path = self.manifest_path(mode)
+            if not manifest_path.exists():
+                return False
+            try:
+                rows = self.load_manifest(mode)
+            except Exception:
+                return False
+            for row in rows:
+                case_path = Path(row.get("case_path", ""))
+                if not case_path.is_absolute():
+                    case_path = HERE / case_path
+                if not case_path.is_file():
+                    return False
+            return True
+
+        if data_is_complete():
             return
-        print(f"[eval] data for mode={mode} missing; running prepare.py ...")
+        force = self.manifest_path(mode).exists()
+        print(f"[eval] data for mode={mode} missing or incomplete; running prepare.py ...")
+        cmd = [sys.executable, str(PREPARE_PY), "--mode", mode]
+        if force:
+            cmd.append("--force")
         result = subprocess.run(
-            [sys.executable, str(PREPARE_PY), "--mode", mode], cwd=str(HERE)
+            cmd, cwd=str(HERE)
         )
-        if result.returncode != 0 or not self.manifest_path(mode).exists():
+        if result.returncode != 0 or not data_is_complete():
             print(f"ERROR: could not prepare data. Run: python prepare.py --mode {mode}")
             sys.exit(1)
 
@@ -584,6 +605,8 @@ class AutoResearch:
             "num_timeouts": count("timeout"),
             "num_exceptions": count("exception"),
             "num_invalid": count("invalid_output"),
+            "num_oom": count("oom"),
+            "num_infrastructure_errors": count("infrastructure_error"),
             "aggregate_score": round(sum(scores), 6),
             "mean_score": round(statistics.fmean(scores), 6) if n else 0.0,
             "median_score": round(statistics.median(scores), 6) if n else 0.0,
@@ -637,6 +660,16 @@ class AutoResearch:
         path = logs / "eval_history.tsv"
         row = self._summary_row(run_id, mode, train_sha, agg, run_dir)
         write_header = not path.exists()
+        if path.exists():
+            try:
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    existing_header = next(csv.reader(f, delimiter="\t"), [])
+                if existing_header != SUMMARY_COLUMNS:
+                    path.rename(logs / f"eval_history_{utc_stamp()}_old_schema.tsv")
+                    write_header = True
+            except Exception:
+                path.rename(logs / f"eval_history_{utc_stamp()}_old_schema.tsv")
+                write_header = True
         with open(path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS, delimiter="\t")
             if write_header:
@@ -672,7 +705,11 @@ class AutoResearch:
         L.append(f"- mean_score: {agg['mean_score']}")
         L.append(f"- median_score: {agg['median_score']}")
         L.append(f"- success_rate: {agg['success_rate']}")
-        L.append(f"- timeouts: {agg['num_timeouts']}  exceptions: {agg['num_exceptions']}  invalid_outputs: {agg['num_invalid']}")
+        L.append(
+            f"- timeouts: {agg['num_timeouts']}  exceptions: {agg['num_exceptions']}  "
+            f"invalid_outputs: {agg['num_invalid']}  oom: {agg['num_oom']}  "
+            f"infrastructure_errors: {agg['num_infrastructure_errors']}"
+        )
         L.append(f"- mean_runtime_s: {agg['mean_runtime_s']}  p95_runtime_s: {agg['p95_runtime_s']}  max_runtime_s: {agg['max_runtime_s']}")
         L.append(f"- mean_peak_rss_mb: {agg['mean_peak_rss_mb']}  max_peak_rss_mb: {agg['max_peak_rss_mb']}")
         if agg.get("_extra"):
@@ -718,6 +755,8 @@ class AutoResearch:
         print(f"timeouts={agg['num_timeouts']}")
         print(f"exceptions={agg['num_exceptions']}")
         print(f"invalid_outputs={agg['num_invalid']}")
+        print(f"oom={agg['num_oom']}")
+        print(f"infrastructure_errors={agg['num_infrastructure_errors']}")
         print()
         print(f"run_dir={run_dir.relative_to(HERE).as_posix()}")
         print("history=logs/eval_history.tsv")
