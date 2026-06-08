@@ -1,0 +1,12 @@
+# Generated at runtime by prepare.py / eval.py
+data/
+runs/
+logs/
+.artifacts/
+
+# Python
+__pycache__/
+*.pyc
+
+# Manual
+instruction.md
