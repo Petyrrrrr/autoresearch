@@ -67,34 +67,45 @@ def solve(instance, *, rng=None, time_budget_s=None, memory_budget_mb=None):
             S = new_S
         return S
 
-    # 2/3. Multi-restart refinement with voting (consensus / bagging). Each
-    #      restart perturbs the degree seed; truly-planted vertices are stable
-    #      across restarts and accumulate votes, while noise vertices do not.
-    deg_f = deg.astype(np.float64)
-    deg_std = float(deg.std()) + 1e-9
-    votes = np.zeros(N, dtype=np.float64)
-    votes[refine(deg_f)] += 1.0  # anchor restart from the clean degree seed
-    restarts = 1
-    max_restarts = 500
-    while restarts < max_restarts and not out_of_time():
-        seed_scores = deg_f + 2.0 * deg_std * rng.standard_normal(N)
-        votes[refine(seed_scores)] += 1.0
-        restarts += 1
+    def vote_pass(seed_base, sigma, pass_deadline):
+        """Accumulate consensus votes: one anchor refine from seed_base, then
+        perturbed restarts (seed_base + sigma-scaled noise) until pass_deadline.
+        Planted vertices recur across restarts; noise vertices do not."""
+        scale = (float(seed_base.std()) + 1e-9) * sigma
+        v = np.zeros(N, dtype=np.float64)
+        v[refine(seed_base)] += 1.0
+        n = 1
+        while n < 5000 and time.perf_counter() < pass_deadline:
+            v[refine(seed_base + scale * rng.standard_normal(N))] += 1.0
+            n += 1
+        return v
 
-    # 4. final ranking: build an OVERSIZED consensus pool (K' = 1.7K) so
-    #    borderline planted members stay in and reinforce each other, refine the
-    #    pool at its own size, then rank ALL vertices by edges into that pool.
-    Kw = min(N - 1, int(round(1.7 * K)))
-    pool = np.zeros(N, dtype=bool)
-    pool[np.argsort(-votes, kind="stable")[:Kw]] = True
-    for _ in range(12):
-        into = A[:, pool].sum(axis=1, dtype=np.int64)
-        top = np.argsort(-into, kind="stable")
-        new_pool = np.zeros(N, dtype=bool)
-        new_pool[top[:Kw]] = True
-        if np.array_equal(new_pool, pool):
-            break
-        pool = new_pool
-    final_affinity = A[:, pool].sum(axis=1, dtype=np.int64)
+    def soft_weights(v):
+        """Concave (cube-root) vote weighting so borderline planted members --
+        which occasionally win votes -- still contribute to the final ranking."""
+        return (v / v.max()) ** (1.0 / 3.0) if v.max() > 0 else v
+
+    # 2/3. TWO-STAGE consensus voting. Stage 1 seeds restarts from the degree
+    #      vector; stage 2 re-seeds restarts from the stage-1 consensus affinity
+    #      (A @ w1), which sits closer to the planted block than raw degree, so
+    #      the faint-signal (low-K) cases reach better local optima. Votes from
+    #      both stages are pooled.
+    deg_f = deg.astype(np.float64)
+    now = time.perf_counter()
+    if deadline is None:
+        # No budget hint: take a single bounded pass so we always return fast.
+        votes = vote_pass(deg_f, 2.0, now + 0.05)
+    else:
+        mid = now + 0.30 * (deadline - now)
+        v1 = vote_pass(deg_f, 2.0, mid)
+        aff1 = A @ soft_weights(v1)            # consensus affinity seed
+        v2 = vote_pass(aff1, 2.0, deadline)
+        votes = v1 + v2
+
+    # 4. final ranking: ONE-SHOT weighted edge mass into the soft consensus set.
+    #    A single pass (no extra fixed-point iteration) avoids the over-iteration
+    #    that makes a hard densest-subgraph fixed point overfit noise edges
+    #    (empirically the one-step ranking beats iterating to convergence).
+    final_affinity = A @ soft_weights(votes)
     ranking = np.argsort(-final_affinity, kind="stable")
     return ranking.tolist()
