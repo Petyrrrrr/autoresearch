@@ -45,17 +45,10 @@ Repeat indefinitely:
    python eval.py --mode dev
    ```
 
-6. Compare against previous runs using:
+6. Compare against previous runs. Keep the change if it improves dev `mean_score` (or improves robustness /
+   runtime without hurting `mean_score`). Otherwise revert it. Log your research attempts and results in RESEARCH_LOG.md.
 
-   ```text
-   logs/eval_history.tsv          # one row per run; look at mean_score / success_rate
-   runs/<run_id>/report.md        # human-readable summary + hardest cases
-   runs/<run_id>/cases.tsv        # per-case detail
-   ```
-
-7. Keep the change if it improves dev `mean_score` (or improves robustness /
-   runtime without hurting `mean_score`). Otherwise revert it.
-8. Go to 1.
+7. Go to 1.
 
 ## Constraints
 
@@ -73,3 +66,7 @@ Repeat indefinitely:
 ## Metric, Task Summary, and Starting Directions
 
 See `task.md` for the evaluation metric, task description, and suggested research directions.
+
+## Prior research
+
+RESEARCH_LOG.md contains possible past research attempts and their results. Try to take a look at it to get an idea of what has been tried and what has worked. As you go, also log your research attempts and results in it.
