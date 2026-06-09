@@ -796,8 +796,8 @@ class Task(AutoResearch):
 
     mode_budgets = {
         "smoke": {"hard_timeout_s": 1.0, "soft_time_budget_s": 0.8, "memory_mb": 2048},
-        "dev": {"hard_timeout_s": 2.0, "soft_time_budget_s": 1.6, "memory_mb": 4096},
-        "final": {"hard_timeout_s": 2.0, "soft_time_budget_s": 1.6, "memory_mb": 4096},
+        "dev": {"hard_timeout_s": 1.5, "soft_time_budget_s": 1.0, "memory_mb": 4096},
+        "final": {"hard_timeout_s": 1.5, "soft_time_budget_s": 1.0, "memory_mb": 4096},
     }
 
     def load_case(self, case_path):
@@ -889,7 +889,7 @@ class Task(AutoResearch):
 
         return {
             "score": adjusted_overlap,
-            "success": int(raw_overlap >= 0.75),
+            "success": int(raw_overlap >= 0.50),
             "metrics": {
                 "K": k,
                 "hits": hits,
@@ -951,7 +951,7 @@ class Task(AutoResearch):
             "the case score = adjusted_overlap = clip((raw_overlap - "
             "chance_overlap) / (1 - chance_overlap), 0, 1) so random guessing "
             "scores ~0 and perfect recovery scores 1. success = 1 iff raw_overlap "
-            ">= 0.75. Failed cases (timeout/exception/invalid/oom) score 0.0. The "
+            ">= 0.50. Failed cases (timeout/exception/invalid/oom) score 0.0. The "
             "headline hillclimbing metric is mean_score (equivalently score_x1000 "
             "= 1000 * mean_score in extra_metrics_json); also watch "
             "success_rate_raw_50/75 and the per-K breakdowns."

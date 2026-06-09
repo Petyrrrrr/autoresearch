@@ -51,26 +51,50 @@ def solve(instance, *, rng=None, time_budget_s=None, memory_budget_mb=None):
     def out_of_time():
         return deadline is not None and time.perf_counter() >= deadline
 
-    # 2. seed the candidate set with the top-K highest-degree vertices.
-    S = np.zeros(N, dtype=bool)
-    S[degree_order[:K]] = True
+    def refine(seed_scores, max_iter=12):
+        """Refine a candidate set: seed with top-K of seed_scores, then
+        repeatedly re-select the K vertices with the most edges into the set."""
+        order = np.argsort(-seed_scores, kind="stable")
+        S = np.zeros(N, dtype=bool)
+        S[order[:K]] = True
+        for _ in range(max_iter):
+            affinity = A[:, S].sum(axis=1, dtype=np.int64)
+            top = np.argsort(-affinity, kind="stable")
+            new_S = np.zeros(N, dtype=bool)
+            new_S[top[:K]] = True
+            if np.array_equal(new_S, S):
+                break
+            S = new_S
+        return S
 
-    # 3. iterative refinement: re-select the K vertices with the most edges into
-    #    the current set. This is a cheap collective swap step that amplifies the
-    #    planted block; it converges in a handful of passes.
-    for _ in range(20):
-        if out_of_time():
-            break
-        affinity = A[:, S].sum(axis=1, dtype=np.int64)  # edges into S per vertex
-        top = np.argsort(-affinity, kind="stable")
-        new_S = np.zeros(N, dtype=bool)
-        new_S[top[:K]] = True
-        if np.array_equal(new_S, S):
-            break
-        S = new_S
+    # 2/3. Multi-restart refinement with voting (consensus / bagging). Each
+    #      restart perturbs the degree seed; truly-planted vertices are stable
+    #      across restarts and accumulate votes, while noise vertices do not.
+    deg_f = deg.astype(np.float64)
+    deg_std = float(deg.std()) + 1e-9
+    votes = np.zeros(N, dtype=np.float64)
+    votes[refine(deg_f)] += 1.0  # anchor restart from the clean degree seed
+    restarts = 1
+    max_restarts = 500
+    while restarts < max_restarts and not out_of_time():
+        seed_scores = deg_f + 2.0 * deg_std * rng.standard_normal(N)
+        votes[refine(seed_scores)] += 1.0
+        restarts += 1
 
-    # 4. rank ALL vertices by edges into the recovered set (high to low) so the
-    #    first K of the returned list are the recovered planted candidates.
-    final_affinity = A[:, S].sum(axis=1, dtype=np.int64)
+    # 4. final ranking: build an OVERSIZED consensus pool (K' = 1.7K) so
+    #    borderline planted members stay in and reinforce each other, refine the
+    #    pool at its own size, then rank ALL vertices by edges into that pool.
+    Kw = min(N - 1, int(round(1.7 * K)))
+    pool = np.zeros(N, dtype=bool)
+    pool[np.argsort(-votes, kind="stable")[:Kw]] = True
+    for _ in range(12):
+        into = A[:, pool].sum(axis=1, dtype=np.int64)
+        top = np.argsort(-into, kind="stable")
+        new_pool = np.zeros(N, dtype=bool)
+        new_pool[top[:Kw]] = True
+        if np.array_equal(new_pool, pool):
+            break
+        pool = new_pool
+    final_affinity = A[:, pool].sum(axis=1, dtype=np.int64)
     ranking = np.argsort(-final_affinity, kind="stable")
     return ranking.tolist()

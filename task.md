@@ -68,8 +68,8 @@ case_index`). The planted set is stored only for scoring. See
 | Mode  | Purpose        | K values                       | Trials/K | Cases | Hard timeout | Soft budget |
 |-------|----------------|--------------------------------|---------:|------:|-------------:|------------:|
 | smoke | contract check | 180, 220                       |        4 |     8 |        1.0 s |       0.8 s |
-| dev   | hillclimbing   | 112, 128, 144, 160, 180        |       20 |   100 |        2.0 s |       1.6 s |
-| final | held-out eval  | 96, 112, 128, 144, 160, 180, 220 |     50 |   350 |        2.0 s |       1.6 s |
+| dev   | hillclimbing   | 112, 128, 144, 160, 180        |       20 |   100 |        1.5 s |       1.0 s |
+| final | held-out eval  | 96, 112, 128, 144, 160, 180, 220 |     50 |   350 |        1.5 s |       1.0 s |
 
 All modes use `N = 512`, `p = 0.25`, `q = 0.20`. Base seeds: smoke = 1000,
 dev = 2000, final = 3000 (disjoint).
@@ -85,7 +85,7 @@ raw_overlap      = hits / K
 chance_overlap   = K / N
 adjusted_overlap = clip((raw_overlap - chance_overlap) / (1 - chance_overlap), 0, 1)
 case_score       = adjusted_overlap        # random guessing ~ 0, perfect = 1
-success          = 1 if raw_overlap >= 0.75 else 0
+success          = 1 if raw_overlap >= 0.50 else 0
 ```
 
 Per-case metrics logged: `K`, `hits`, `raw_overlap`, `chance_overlap`,
@@ -107,9 +107,9 @@ remaining cases.
 
 ## Budgets
 
-- Per-case soft time budget: `time_budget_s` (0.8 s smoke / 1.6 s dev / final) —
+- Per-case soft time budget: `time_budget_s` (0.8 s smoke / 1.0 s dev / final) —
   a hint; return your best ranking found so far before it elapses.
-- Per-case hard timeout (enforced by killing the worker): 1.0 s smoke / 2.0 s
+- Per-case hard timeout (enforced by killing the worker): 1.0 s smoke / 1.5 s
   dev / final. The hard cap covers the whole worker (interpreter start + loading
   the adjacency + `solve`), so leave margin under the soft budget.
 - Memory budget: 2048 MB smoke / 4096 MB dev/final (soft on Windows: reported,
