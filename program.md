@@ -31,7 +31,7 @@ Repeat indefinitely:
 
 1. Inspect the current `train.py` and recall the best score so far
    (check `logs/eval_history.tsv`).
-2. Form ONE concrete hypothesis for improvement of the current `train.py` (e.g. "add local-search")
+2. Form ONE concrete hypothesis for improvement of the current `train.py` (e.g. "add a centered spectral refinement step")
 3. Modify ONLY `train.py`.
 4. Smoke test (fast contract check after any risky edit):
 

@@ -4,11 +4,17 @@ It must expose:
 
     solve(instance, *, rng=None, time_budget_s=None, memory_budget_mb=None)
 
-See task.md for the exact input/output contract. The baseline below is a
-simple, valid, fast random-restart heuristic for Max-Cut. There is a lot of
-headroom above it (greedy assignment, local search / vertex flipping, simulated
-annealing, spectral / SDP-style rounding, ...). Replace the body freely as long
-as you keep the `solve` signature and return a valid candidate.
+See task.md for the exact input/output contract. The task is Planted Dense
+Subgraph recovery: a hidden set S of size K is planted in an N-vertex graph
+(edge prob p inside S, q elsewhere). Return a ranked vertex list; the evaluator
+keeps the first K valid unique vertices and scores their overlap with S.
+
+The baseline below is simple, valid, fast, and nontrivial. It seeds a candidate
+set with the highest-degree vertices and refines it by repeatedly re-selecting
+the K vertices with the most edges into the current set. There is a lot of
+headroom above it (centered spectral power iteration, likelihood-weighted
+scoring, message passing, multi-restart voting, true local swaps). Replace the
+body freely as long as you keep the `solve` signature and return a ranked list.
 """
 
 import time
@@ -17,50 +23,54 @@ import numpy as np
 
 
 def solve(instance, *, rng=None, time_budget_s=None, memory_budget_mb=None):
-    """Return a partition of the graph's vertices as a length-n array of {0, 1}.
+    """Return a ranked list of vertex indices (best candidates first).
 
-    instance["inputs"] = {"n": int, "edges": int array of shape (E, 2)}
-
-    Strategy (baseline): try many random partitions and keep the best cut found
-    within the soft time budget. Always returns the best result found so far.
+    instance = {"A": (N, N) uint8 adjacency, "N": int, "K": int,
+                "p": float, "q": float}
     """
-    inputs = instance["inputs"]
-    n = int(inputs["n"])
-    edges = np.asarray(inputs["edges"])
+    A = np.asarray(instance["A"])
+    N = int(instance.get("N", A.shape[0]))
+    K = int(instance["K"])
+    # q (background edge prob) is available for likelihood/centering ideas.
+    q = float(instance.get("q", 0.20))
 
     if rng is None:
         rng = np.random.default_rng(0)
 
-    # Degenerate graph: any assignment is optimal (cut = 0).
-    if n == 0:
-        return np.zeros(0, dtype=np.int8)
-    if edges.shape[0] == 0:
-        return np.zeros(n, dtype=np.int8)
+    # 1. vertex degrees -> a degree ranking (always a valid fallback).
+    deg = A.sum(axis=1, dtype=np.int64)
+    degree_order = np.argsort(-deg, kind="stable")
+    if K <= 0 or K >= N:
+        return degree_order.tolist()
 
-    u = edges[:, 0]
-    v = edges[:, 1]
+    # Soft-budget deadline; leave margin so the worker never hits the hard cap.
+    deadline = None
+    if time_budget_s is not None:
+        deadline = time.perf_counter() + 0.8 * float(time_budget_s)
 
-    def cut_value(side):
-        return int(np.count_nonzero(side[u] != side[v]))
+    def out_of_time():
+        return deadline is not None and time.perf_counter() >= deadline
 
-    best = rng.integers(0, 2, size=n).astype(np.int8)
-    best_cut = cut_value(best)
+    # 2. seed the candidate set with the top-K highest-degree vertices.
+    S = np.zeros(N, dtype=bool)
+    S[degree_order[:K]] = True
 
-    deadline = None if time_budget_s is None else time.perf_counter() + float(time_budget_s)
-    max_iters_when_unbudgeted = 500
-    iters = 0
-    while True:
-        if deadline is not None:
-            if time.perf_counter() >= deadline:
-                break
-        elif iters >= max_iters_when_unbudgeted:
+    # 3. iterative refinement: re-select the K vertices with the most edges into
+    #    the current set. This is a cheap collective swap step that amplifies the
+    #    planted block; it converges in a handful of passes.
+    for _ in range(20):
+        if out_of_time():
             break
+        affinity = A[:, S].sum(axis=1, dtype=np.int64)  # edges into S per vertex
+        top = np.argsort(-affinity, kind="stable")
+        new_S = np.zeros(N, dtype=bool)
+        new_S[top[:K]] = True
+        if np.array_equal(new_S, S):
+            break
+        S = new_S
 
-        candidate = rng.integers(0, 2, size=n).astype(np.int8)
-        cut = cut_value(candidate)
-        if cut > best_cut:
-            best_cut = cut
-            best = candidate
-        iters += 1
-
-    return best
+    # 4. rank ALL vertices by edges into the recovered set (high to low) so the
+    #    first K of the returned list are the recovered planted candidates.
+    final_affinity = A[:, S].sum(axis=1, dtype=np.int64)
+    ranking = np.argsort(-final_affinity, kind="stable")
+    return ranking.tolist()

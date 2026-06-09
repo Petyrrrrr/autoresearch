@@ -791,69 +791,78 @@ class AutoResearch:
 # Optionally override aggregate_extra for task-specific summary metrics.
 
 class Task(AutoResearch):
-    task_name = "max_cut"
+    task_name = "planted_dense_subgraph"
     task_version = "v0"
 
     mode_budgets = {
-        "smoke": {"hard_timeout_s": 10, "soft_time_budget_s": 1.0, "memory_mb": 2048},
-        "dev": {"hard_timeout_s": 30, "soft_time_budget_s": 3.0, "memory_mb": 4096},
-        "final": {"hard_timeout_s": 60, "soft_time_budget_s": 8.0, "memory_mb": 4096},
+        "smoke": {"hard_timeout_s": 1.0, "soft_time_budget_s": 0.8, "memory_mb": 2048},
+        "dev": {"hard_timeout_s": 2.0, "soft_time_budget_s": 1.6, "memory_mb": 4096},
+        "final": {"hard_timeout_s": 2.0, "soft_time_budget_s": 1.6, "memory_mb": 4096},
     }
 
     def load_case(self, case_path):
         with np.load(case_path) as data:
             return {
-                "n": int(data["n"]),
-                "edges_u": data["edges_u"].astype(np.int64),
-                "edges_v": data["edges_v"].astype(np.int64),
-                "reference_cut": int(data["reference_cut"]),  # hidden from solver
+                "A": data["A"].astype(np.uint8),
+                "hidden": data["hidden"].astype(np.int64),  # hidden from solver
+                "N": int(data["N"]),
+                "K": int(data["K"]),
+                "p": float(data["p"]),
+                "q": float(data["q"]),
             }
 
     def make_instance_for_train(self, raw_case):
-        u = raw_case["edges_u"]
-        v = raw_case["edges_v"]
-        if u.shape[0] > 0:
-            edges = np.stack([u, v], axis=1)
-        else:
-            edges = np.zeros((0, 2), dtype=np.int64)
-        # Deliberately omits reference_cut: the solver must not see the answer.
+        # Deliberately omits 'hidden': the solver must not see the planted set.
         return {
-            "inputs": {"n": raw_case["n"], "edges": edges},
-            "metadata": {"num_edges": int(u.shape[0])},
-            "budgets": {},
+            "A": raw_case["A"],
+            "N": int(raw_case["N"]),
+            "K": int(raw_case["K"]),
+            "p": float(raw_case["p"]),
+            "q": float(raw_case["q"]),
         }
 
     def sanitize_output(self, raw_output, raw_case):
-        n = int(raw_case["n"])
-        summary = {"n": n}
+        """Coerce the solver output into an ordered list of unique valid vertex
+        indices. Never raises; returns a rejection dict on bad input."""
+        n = int(raw_case["N"])
+        k = int(raw_case["K"])
+        summary = {"N": n, "K": k}
         if raw_output is None:
             return self._invalid(summary, "solver returned None")
+
+        # Accept any iterable (list/tuple/array/range/generator).
         try:
             arr = np.asarray(raw_output)
+            if arr.dtype == object or arr.ndim == 0:
+                arr = np.asarray(list(raw_output))
         except Exception as exc:
-            return self._invalid(summary, f"not array-like: {short_err(exc)}")
+            return self._invalid(summary, f"output not iterable: {short_err(exc)}")
 
         flat = arr.reshape(-1)
-        if flat.shape[0] != n:
-            return self._invalid(summary, f"expected length-{n} vector, got {flat.shape[0]}")
+        summary["num_returned"] = int(flat.shape[0])
 
-        if arr.dtype == bool:
-            side = flat.astype(np.int8)
+        # Coerce to integer indices, rejecting non-finite / non-numeric values.
+        if np.issubdtype(flat.dtype, np.floating):
+            if not np.all(np.isfinite(flat)):
+                return self._invalid(summary, "indices contain non-finite values")
+            idx = np.floor(flat).astype(np.int64)
+        elif np.issubdtype(flat.dtype, np.integer) or flat.dtype == bool:
+            idx = flat.astype(np.int64)
         else:
             try:
-                uniq = np.unique(flat)
+                idx = flat.astype(np.int64)
             except Exception as exc:
-                return self._invalid(summary, f"uncomparable values: {short_err(exc)}")
-            if np.all(np.isin(uniq, [0, 1])):
-                side = flat.astype(np.int8)
-            elif np.all(np.isin(uniq, [-1, 1])):
-                side = (flat > 0).astype(np.int8)
-            else:
-                return self._invalid(summary, "values must be in {0,1} or {-1,1}")
+                return self._invalid(summary, f"indices not integer-coercible: {short_err(exc)}")
 
-        ones = int(side.sum())
-        summary.update({"ones": ones, "balance": round(ones / max(1, n), 3)})
-        return {"ok": True, "sanitized": side, "output_summary": summary,
+        # Keep only in-range vertices, deduped, preserving first-seen order.
+        in_range = idx[(idx >= 0) & (idx < n)]
+        if in_range.shape[0] == 0:
+            return self._invalid(summary, "no valid vertex indices in [0, N)")
+        _, first_pos = np.unique(in_range, return_index=True)
+        ordered = in_range[np.sort(first_pos)]
+
+        summary["num_valid_unique"] = int(ordered.shape[0])
+        return {"ok": True, "sanitized": ordered, "output_summary": summary,
                 "error_type": "", "error_message": ""}
 
     @staticmethod
@@ -862,49 +871,90 @@ class Task(AutoResearch):
                 "error_type": "invalid_output", "error_message": message}
 
     def score_case(self, sanitized_output, raw_case):
-        side = sanitized_output
-        u = raw_case["edges_u"]
-        v = raw_case["edges_v"]
-        m = int(u.shape[0])
-        ref = int(raw_case["reference_cut"])
+        n = int(raw_case["N"])
+        k = int(raw_case["K"])
+        hidden = set(int(x) for x in raw_case["hidden"].tolist())
 
-        cut = int(np.count_nonzero(side[u] != side[v])) if m > 0 else 0
-        denom = ref if ref > 0 else 1
-        score = cut / denom
+        # The evaluator keeps the first K valid unique vertices.
+        pred = set(int(x) for x in sanitized_output[:k].tolist())
+        hits = len(pred & hidden)
+
+        raw_overlap = hits / k if k > 0 else 0.0
+        chance_overlap = k / n if n > 0 else 0.0
+        if chance_overlap >= 1.0:
+            adjusted_overlap = 0.0
+        else:
+            adjusted_overlap = (raw_overlap - chance_overlap) / (1.0 - chance_overlap)
+        adjusted_overlap = max(0.0, min(1.0, adjusted_overlap))
+
         return {
-            "score": score,
-            "success": 1 if cut >= ref else 0,
+            "score": adjusted_overlap,
+            "success": int(raw_overlap >= 0.75),
             "metrics": {
-                "cut_value": cut,
-                "reference_cut": ref,
-                "num_edges": m,
-                "cut_fraction": round(cut / m, 4) if m > 0 else 0.0,
-                "gap_to_reference": cut - ref,
-                "normalized_cut": round(score, 4),
+                "K": k,
+                "hits": hits,
+                "raw_overlap": round(raw_overlap, 6),
+                "chance_overlap": round(chance_overlap, 6),
+                "adjusted_overlap": round(adjusted_overlap, 6),
+                "success_raw_50": int(raw_overlap >= 0.50),
+                "success_raw_75": int(raw_overlap >= 0.75),
             },
         }
 
     def aggregate_extra(self, case_rows):
-        ok = [r for r in case_rows if r["status"] == "ok"]
-        fractions = []
-        for r in ok:
+        """Per-K and overlap aggregates. Failed cases (no metrics) count as 0."""
+        n = len(case_rows)
+        raws, adjs, s50, s75 = [], [], [], []
+        by_k = {}  # K -> {"score": [...], "raw": [...], "adj": [...]}
+        for r in case_rows:
             try:
-                fractions.append(json.loads(r["metrics_json"]).get("cut_fraction", 0.0))
+                m = json.loads(r["metrics_json"])
             except Exception:
-                pass
+                m = {}
+            raw = float(m.get("raw_overlap", 0.0))
+            adj = float(m.get("adjusted_overlap", 0.0))
+            raws.append(raw)
+            adjs.append(adj)
+            s50.append(int(m.get("success_raw_50", 0)))
+            s75.append(int(m.get("success_raw_75", 0)))
+            try:
+                k = int(json.loads(r["params_json"]).get("K"))
+            except Exception:
+                k = None
+            if k is not None:
+                bucket = by_k.setdefault(k, {"score": [], "raw": [], "adj": []})
+                bucket["score"].append(float(r["score"]))
+                bucket["raw"].append(raw)
+                bucket["adj"].append(adj)
+
+        def mean(xs):
+            return round(statistics.fmean(xs), 6) if xs else 0.0
+
+        mean_score = mean([float(r["score"]) for r in case_rows])
         return {
-            "mean_cut_fraction": round(statistics.fmean(fractions), 4) if fractions else 0.0,
-            "num_beat_reference": sum(1 for r in case_rows if r["success"] == 1),
+            # Instruction's headline aggregate_score = 1000 * mean(case_score).
+            "score_x1000": round(1000.0 * mean_score, 3),
+            "mean_raw_overlap": mean(raws),
+            "mean_adjusted_overlap": mean(adjs),
+            "success_rate_raw_50": mean(s50),
+            "success_rate_raw_75": mean(s75),
+            "mean_score_by_K": {str(k): mean(by_k[k]["score"]) for k in sorted(by_k)},
+            "mean_raw_overlap_by_K": {str(k): mean(by_k[k]["raw"]) for k in sorted(by_k)},
+            "mean_adjusted_overlap_by_K": {str(k): mean(by_k[k]["adj"]) for k in sorted(by_k)},
         }
 
     def scoring_description(self):
         return (
-            "score = cut_value / reference_cut, where reference_cut is a "
-            "deterministic greedy 1-pass cut computed at prepare time and hidden "
-            "from the solver. success = 1 iff cut_value >= reference_cut. Higher "
-            "is better; score > 1.0 beats the greedy reference. Failed cases "
-            "(timeout/exception/invalid/oom) receive score 0.0. The headline "
-            "metric for hillclimbing is mean_score; also watch success_rate."
+            "Each case plants a hidden set S of size K. The solver returns a "
+            "ranked vertex list; the first K valid unique vertices form the "
+            "prediction P. raw_overlap = |P n S| / K, chance_overlap = K / N, and "
+            "the case score = adjusted_overlap = clip((raw_overlap - "
+            "chance_overlap) / (1 - chance_overlap), 0, 1) so random guessing "
+            "scores ~0 and perfect recovery scores 1. success = 1 iff raw_overlap "
+            ">= 0.75. Failed cases (timeout/exception/invalid/oom) score 0.0. The "
+            "headline hillclimbing metric is mean_score (equivalently score_x1000 "
+            "= 1000 * mean_score in extra_metrics_json); also watch "
+            "success_rate_raw_50/75 and the per-K breakdowns."
         )
 
 

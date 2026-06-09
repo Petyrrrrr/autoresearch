@@ -43,111 +43,100 @@ HERE = Path(__file__).resolve().parent
 #
 # Everything below the next banner is generic and should not need changes.
 
-TASK_NAME = "max_cut"
+TASK_NAME = "planted_dense_subgraph"
 TASK_VERSION = "v0"
 
+# Planted Dense Subgraph (PDS) model constants (fixed across all cases/modes).
+N = 512            # number of vertices
+P_IN = 0.25        # edge probability inside the planted set S
+Q_OUT = 0.20       # edge probability everywhere else (background)
+
+
+def _expand_cases(k_values, trials_per_k):
+    """One parameter dict per case: every K repeated ``trials_per_k`` times.
+
+    Each trial gets a distinct case_index (and therefore a distinct seed), so
+    repeated K values are different random graphs.
+    """
+    cases = []
+    for k in k_values:
+        for _ in range(int(trials_per_k)):
+            cases.append({"N": N, "K": int(k), "p": P_IN, "q": Q_OUT})
+    return cases
+
+
 # Seed policy (instruction recommendation): case seed = base_seed + case_index.
-# Modes must be progressively harder; final uses disjoint seeds from dev.
+# Modes use disjoint base seeds; final is larger and held-out-style.
 MODES = {
     "smoke": {
         "base_seed": 1000,
-        "cases": [
-            {"n": 30, "p": 0.5},
-            {"n": 50, "p": 0.3},
-            {"n": 40, "p": 0.5},
-        ],
+        "cases": _expand_cases([180, 220], trials_per_k=4),
     },
     "dev": {
         "base_seed": 2000,
-        "cases": [
-            {"n": 100, "p": 0.20},
-            {"n": 150, "p": 0.15},
-            {"n": 200, "p": 0.10},
-            {"n": 250, "p": 0.10},
-            {"n": 300, "p": 0.08},
-            {"n": 120, "p": 0.25},
-            {"n": 180, "p": 0.12},
-            {"n": 220, "p": 0.10},
-        ],
+        "cases": _expand_cases([112, 128, 144, 160, 180], trials_per_k=20),
     },
     "final": {
         "base_seed": 3000,
-        "cases": [
-            {"n": 350, "p": 0.08},
-            {"n": 400, "p": 0.05},
-            {"n": 450, "p": 0.06},
-            {"n": 500, "p": 0.05},
-            {"n": 550, "p": 0.05},
-            {"n": 600, "p": 0.04},
-        ],
+        "cases": _expand_cases([96, 112, 128, 144, 160, 180, 220], trials_per_k=50),
     },
 }
 
 
-def _greedy_reference_cut(n, u, v):
-    """Deterministic greedy 1-pass Max-Cut, used as the hidden reference value.
-
-    Vertices are processed in index order; each vertex is placed on the side
-    that maximizes the number of cut edges to already-placed neighbours. This
-    is cheap, deterministic, and a sensible "par" score for normalization.
-    """
-    adj = [[] for _ in range(n)]
-    for a, b in zip(u.tolist(), v.tolist()):
-        adj[a].append(b)
-        adj[b].append(a)
-    side = np.full(n, -1, dtype=np.int8)
-    for i in range(n):
-        c0 = 0
-        c1 = 0
-        for j in adj[i]:
-            s = side[j]
-            if s == 0:
-                c0 += 1
-            elif s == 1:
-                c1 += 1
-        # Put i opposite the heavier already-placed side to maximize the cut.
-        side[i] = 1 if c0 >= c1 else 0
-    return int(np.sum(side[u] != side[v])) if u.shape[0] > 0 else 0
-
-
 def generate_case(seed, params):
-    """Build one deterministic case.
+    """Build one deterministic Planted Dense Subgraph case.
 
-    Returns a dict of arrays/scalars that ``save_case`` will serialize. Anything
-    placed here that is an "answer" (e.g. the reference value) must be stripped
-    out by ``Task.make_instance_for_train`` in eval.py so the solver never sees
-    it.
+    A hidden set ``S`` of size ``K`` is chosen uniformly at random. Edges inside
+    ``S`` appear with probability ``p``; all other edges with probability ``q``.
+
+    Returns a dict of arrays/scalars that ``save_case`` will serialize. The
+    hidden planted set is stored for scoring only; ``Task.make_instance_for_train``
+    in eval.py strips it so the solver never sees the answer.
     """
-    rng = np.random.default_rng(seed)
-    n = int(params["n"])
+    n = int(params["N"])
+    k = int(params["K"])
     p = float(params["p"])
+    q = float(params["q"])
+    rng = np.random.default_rng(seed)
 
-    # Erdos-Renyi G(n, p): sample the upper triangle, no networkx required.
-    iu, iv = np.triu_indices(n, k=1)
-    keep = rng.random(iu.shape[0]) < p
-    u = iu[keep].astype(np.int64)
-    v = iv[keep].astype(np.int64)
+    # Hidden planted set S (sorted for reproducibility); never shown to solver.
+    hidden = rng.choice(n, size=k, replace=False)
+    hidden = np.sort(hidden).astype(np.int64)
 
-    reference_cut = _greedy_reference_cut(n, u, v)
+    # Sample the upper triangle: edge prob is p inside S x S, q otherwise.
+    upper_i, upper_j = np.triu_indices(n, k=1)
+    edge_probs = np.full(len(upper_i), q, dtype=np.float64)
+    hidden_mask = np.zeros(n, dtype=bool)
+    hidden_mask[hidden] = True
+    inside = hidden_mask[upper_i] & hidden_mask[upper_j]
+    edge_probs[inside] = p
+    edges = rng.random(len(upper_i)) < edge_probs
+
+    A = np.zeros((n, n), dtype=np.uint8)
+    A[upper_i, upper_j] = edges
+    A[upper_j, upper_i] = edges
+    np.fill_diagonal(A, 0)
+
     return {
-        "n": np.int64(n),
-        "edges_u": u,
-        "edges_v": v,
-        "reference_cut": np.int64(reference_cut),
+        "A": A,
+        "hidden": hidden,        # hidden answer; stripped before train.solve
+        "N": np.int64(n),
+        "K": np.int64(k),
+        "p": np.float64(p),
+        "q": np.float64(q),
         # Stored for the manifest/report only; not exposed to train.solve.
-        "_params": {"n": n, "p": p},
-        "_input_size": {"vertices": n, "edges": int(u.shape[0])},
+        "_params": {"N": n, "K": k, "p": p, "q": q},
+        "_input_size": {"N": n, "K": k, "num_edges": int(edges.sum())},
     }
 
 
 def runtime_class(params):
-    """Coarse hint logged in the manifest (purely descriptive)."""
-    n = int(params["n"])
-    if n <= 60:
-        return "fast"
-    if n <= 350:
-        return "medium"
-    return "slow"
+    """Coarse hint logged in the manifest (purely descriptive).
+
+    Every case is N=512; cost is dominated by the O(N^2) adjacency, so all
+    cases land in the same class regardless of K.
+    """
+    return "medium"
 
 
 def describe_dataset():
@@ -158,20 +147,24 @@ def describe_dataset():
     lines.append("## Task")
     lines.append("")
     lines.append(
-        "Unweighted **Max-Cut** on Erdos-Renyi random graphs `G(n, p)`. Each case "
-        "is a graph; the solver must partition the vertices into two sides to "
-        "maximize the number of edges crossing the partition (the *cut*)."
+        "**Planted Dense Subgraph** recovery. Each case is an undirected graph on "
+        f"`N = {N}` vertices in which a hidden set `S` of size `K` has been "
+        f"planted: edges inside `S` appear with probability `p = {P_IN}`, while "
+        f"every other edge appears with probability `q = {Q_OUT}`. The solver "
+        "receives the adjacency matrix and must return a ranked list of vertices; "
+        "the evaluator keeps the first `K` valid unique vertices and scores their "
+        "overlap with `S`."
     )
     lines.append("")
     lines.append("## How cases are generated")
     lines.append("")
     lines.append(
-        "For each case we seed a `numpy.random.default_rng(seed)`, sample the "
-        "upper triangle of the adjacency matrix (an edge `(i, j)` exists with "
-        "probability `p`), and store the resulting edge list. A deterministic "
-        "greedy 1-pass cut is computed and stored as the hidden `reference_cut` "
-        "used for scoring normalization. The reference is **not** passed to the "
-        "solver."
+        "For each case we seed a `numpy.random.default_rng(seed)`, draw the hidden "
+        "set `S` of size `K` uniformly without replacement, then sample the upper "
+        "triangle of the adjacency matrix: pair `(i, j)` is an edge with "
+        "probability `p` if both endpoints are in `S`, otherwise with probability "
+        "`q`. The diagonal is zero and the matrix is symmetric. The hidden set `S` "
+        "is stored for scoring but is **not** passed to the solver."
     )
     lines.append("")
     lines.append("## Seed policy")
@@ -183,14 +176,12 @@ def describe_dataset():
     lines.append("")
     lines.append("## Modes")
     lines.append("")
-    lines.append("| Mode | Cases | n range | p range |")
-    lines.append("|---|---:|---|---|")
+    lines.append("| Mode | Cases | N | K values | p | q |")
+    lines.append("|---|---:|---:|---|---:|---:|")
     for mode, cfg in MODES.items():
-        ns = [c["n"] for c in cfg["cases"]]
-        ps = [c["p"] for c in cfg["cases"]]
-        lines.append(
-            f"| {mode} | {len(cfg['cases'])} | {min(ns)}-{max(ns)} | {min(ps)}-{max(ps)} |"
-        )
+        ks = sorted({c["K"] for c in cfg["cases"]})
+        k_str = ", ".join(str(k) for k in ks)
+        lines.append(f"| {mode} | {len(cfg['cases'])} | {N} | {k_str} | {P_IN} | {Q_OUT} |")
     lines.append("")
     lines.append("## Files produced")
     lines.append("")
@@ -200,7 +191,8 @@ def describe_dataset():
     lines.append(f"data/{TASK_NAME}/{TASK_VERSION}/DATASET.md             # this file")
     lines.append("```")
     lines.append("")
-    lines.append("Each `.npz` holds: `n`, `edges_u`, `edges_v`, `reference_cut`.")
+    lines.append("Each `.npz` holds: `A` (N x N uint8 adjacency), `hidden` (the "
+                 "planted set, hidden from the solver), `N`, `K`, `p`, `q`.")
     lines.append("")
     lines.append("## Regenerating")
     lines.append("")
@@ -211,10 +203,11 @@ def describe_dataset():
     lines.append("## Known runtime concerns")
     lines.append("")
     lines.append(
-        "Graphs are dense for small `n` and sparse for large `n`, keeping edge "
-        "counts (and per-case evaluation time) modest. Generation is O(n^2) in "
-        "the number of candidate edges; all sizes here generate in well under a "
-        "second."
+        "Every graph is dense (N=512, edge probabilities 0.20-0.25), so each "
+        "adjacency matrix is ~256 KB and generation is O(N^2) per case (a few "
+        "milliseconds). The planted signal is faint: an inside vertex has only "
+        "about `(K-1)*(p-q)` extra expected degree, comparable to the degree "
+        "standard deviation, which is what makes recovery non-trivial."
     )
     lines.append("")
     return "\n".join(lines)
@@ -276,7 +269,7 @@ def prepare_mode(mode, force=False):
                 "params_json": json.dumps(case.get("_params", params), separators=(",", ":")),
                 "input_size_json": json.dumps(case.get("_input_size", {}), separators=(",", ":")),
                 "expected_runtime_class": runtime_class(params),
-                "notes": "G(n,p) random graph; reference=greedy 1-pass cut",
+                "notes": "planted dense subgraph; hidden set S stored for scoring only",
             }
         )
 
